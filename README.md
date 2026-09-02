@@ -1,93 +1,166 @@
 # bifrost
 
+A sidecar that syncs folders between Nextcloud and a Minecraft server's `/data`,
+and restarts the server when they change.
 
+Drop a mod jar into a Nextcloud folder from a laptop; a minute later it is on the
+server, players get a countdown, and the server comes back with the mod loaded.
+Remove the jar and it is uninstalled the same way.
 
-## Getting started
+No Docker socket. No FUSE mount. No privileged access of any kind — bifrost talks
+HTTPS to Nextcloud and RCON to the server, and that is the whole attack surface.
 
-To make it easy for you to get started with GitLab, here's a list of recommended next steps.
+## How a pass works
 
-Already a pro? Just edit this README.md and make it your own. Want to make it easy? [Use the template at the bottom](#editing-this-readme)!
+Every `BIFROST_POLL_INTERVAL`, for each rule:
 
-## Add your files
+1. **List** the remote folder with a recursive `PROPFIND Depth: 1` walk.
+2. **Plan** against the sync journal: what is new, what changed, what a previous
+   pass placed and has since disappeared.
+3. **Guard.** Abort the whole pass if the folder's sentinel is missing, if the
+   listing is empty when it should not be, or if too much would be deleted.
+4. **Stage** every download into `.bifrost/stage`. `/data` is untouched until the
+   last byte has arrived.
+5. **Settle.** Wait `BIFROST_SETTLE` for more changes, so eight jars dropped over
+   ninety seconds become one restart instead of eight.
+6. **Apply.** Snapshot the folder, then move each file into place with a rename.
+   Removals go to a trash directory, never to `unlink`.
+7. **React.** `save-all flush`, a countdown over `say`, then `stop`. Docker's
+   restart policy brings the server back.
+8. **Verify.** Reconnect over RCON until the server answers. If it never does,
+   restore the snapshot, quarantine the new files, and try once more.
 
-- [ ] [Create](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#create-a-file) or [upload](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#upload-a-file) files
-- [ ] [Add files using the command line](https://docs.gitlab.com/topics/git/add_files/#add-files-to-a-git-repository) or push an existing Git repository with the following command:
+## Quick start
 
+```sh
+cp .env.example .env                                  # RCON_PASSWORD
+mkdir -p secrets
+printf '%s' '<nextcloud app password>' > secrets/nextcloud_app_password
+cp docker-compose.example.yml docker-compose.yml      # then edit the URL and paths
+docker compose up -d
 ```
-cd existing_repo
-git remote add origin https://gitlab.internal.rferee.dev/rferee/bifrost.git
-git branch -M master
-git push -uf origin master
+
+Set `BIFROST_INIT_REMOTE=1` for the first start — it creates the remote folders
+and their sentinel files — then remove it, so a folder that later goes missing is
+an error rather than something bifrost silently recreates.
+
+Use a **Nextcloud app password**, and ideally a dedicated Nextcloud user that owns
+the bifrost folders and shares them out to you. App passwords cannot be scoped to
+a folder: whatever credential bifrost holds can reach the whole account.
+
+## Configuration
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `BIFROST_NEXTCLOUD_URL` | *required* | e.g. `https://cloud.example.com` |
+| `BIFROST_NEXTCLOUD_USER` | *required* | Nextcloud username |
+| `BIFROST_NEXTCLOUD_PASSWORD` / `_FILE` | *required* | App password. Prefer `_FILE` with a Docker secret |
+| `BIFROST_REMOTE_ROOT` | *(account root)* | Path all rules hang off, e.g. `bifrost/bdgncraft` |
+| `BIFROST_DATA_DIR` | `/data` | The server's data volume |
+| `BIFROST_STATE_DIR` | `<data>/.bifrost` | Journal, staging, snapshots, trash |
+| `BIFROST_POLL_INTERVAL` | `5m` | How often to look |
+| `BIFROST_SETTLE` | `30s` | Quiet period before firing a behavior |
+| `BIFROST_SETTLE_MAX` | `5m` | Ceiling on deferring a behavior |
+| `BIFROST_RCON` | — | `<service>:25575`. Required if any rule has a behavior |
+| `BIFROST_RCON_PASSWORD` / `_FILE` | *(read from `/data`)* | Falls back to itzg's generated password |
+| `BIFROST_RESTART_COUNTDOWN` | `60s` | Warning time. Skipped when nobody is online |
+| `BIFROST_BOOT_TIMEOUT` | `5m` | How long to wait for the server to come back |
+| `BIFROST_MAX_DELETE` | `3` | Absolute deletion limit per pass |
+| `BIFROST_MAX_DELETE_PCT` | `25` | Relative deletion limit per pass |
+| `BIFROST_WORKERS` | `4` | Concurrent transfers |
+| `BIFROST_TRASH_RETENTION_DAYS` | `14` | How long deleted files are kept |
+| `BIFROST_DRY_RUN` | `0` | Log the plan, change nothing |
+| `BIFROST_INIT_REMOTE` | `0` | Create missing remote folders and sentinels |
+| `BIFROST_TLS_VERIFY` | `1` | `0`, or a path to a CA bundle |
+| `BIFROST_LOG_LEVEL` | `INFO` | |
+
+### Rules
+
+Numbered, one folder each:
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `BIFROST_RULE_<n>` | — | Folder under `/data`, e.g. `mods` |
+| `BIFROST_RULE_<n>_DIRECTION` | `pull` | `pull` (Nextcloud → server) or `push` |
+| `BIFROST_RULE_<n>_DELETE` | `off` | `off`, or `mirror` to propagate deletions |
+| `BIFROST_RULE_<n>_BEHAVIOR` | `none` | `none`, `restart`, or `rcon:<cmd>;<cmd>` |
+| `BIFROST_RULE_<n>_REMOTE` | *(same as local)* | Remote folder name, if it differs |
+| `BIFROST_RULE_<n>_EXCLUDE` | — | Comma-separated globs |
+
+Two rules on one folder — a `pull` and a `push` — share a journal, so they do not
+fight. That is the recommended `mods` setup: pull is authoritative, push seeds the
+Nextcloud folder on the first run and backs up anything dropped in over SSH.
+
+There is no `sync` direction. Real two-way sync needs conflict copies, tombstones
+and a settle window against a server that rewrites its own config files on every
+boot; until that is built, saying `sync` gets you a startup error rather than a
+tool quietly doing something else.
+
+## Safety
+
+Every one of these exists because the failure it prevents is easy to trigger:
+
+- **Sentinel file.** A `.bifrost-root` must be present in each managed remote
+  folder. A revoked share, a renamed folder, a maintenance-mode error page and a
+  typo'd path all produce a listing that reads as *the user deleted everything*.
+- **Deletion caps.** More than `max(3 files, 25%)` disappearing aborts the whole
+  pass rather than skipping individual files.
+- **Empty-listing guard.** A folder that once had files and now lists none is an
+  error, not an instruction — unless nothing has ever been synced, which is the
+  seeding case.
+- **Trash, not unlink.** Removals move into `.bifrost/trash/<timestamp>/`.
+- **Rename, never overwrite.** The JVM holds mod jars open by inode; rewriting one
+  under a running server can take it down.
+- **Rollback and quarantine.** If the server does not come back, the pre-apply
+  snapshot is restored and the new files are quarantined *by content hash*, so the
+  same jar is not re-downloaded and re-applied on the next poll.
+- **Breaker.** If the rollback also fails to boot, bifrost stops touching the
+  server entirely until you restart it with `BIFROST_RESET_BREAKER=1`.
+- **Never-sync list.** `server.properties` (it holds `rcon.password` in plaintext),
+  `ops.json`, `whitelist.json`, `banned-*.json`, `usercache.json`, `world/`,
+  `logs/`, `crash-reports/`, `libraries/` are refused whatever the config says.
+- **401 is fatal.** Roughly ten failed logins in thirty minutes trips Nextcloud's
+  brute-force protection with a 429 lasting hours, for every service sharing that
+  IP. bifrost never retries bad credentials on a timer.
+
+Losing `.bifrost/state.db` is safe: an empty journal degrades bifrost to
+additive-only and re-downloads everything.
+
+## Operations
+
+```sh
+docker compose logs -f bdgncraft-bifrost
+docker compose run --rm bdgncraft-bifrost --once          # one pass, then exit
+BIFROST_DRY_RUN=1 docker compose up bdgncraft-bifrost     # plan only
+BIFROST_RESET_BREAKER=1 docker compose up -d bdgncraft-bifrost
+BIFROST_CLEAR_QUARANTINE=1 docker compose up -d bdgncraft-bifrost
 ```
 
-## Integrate with your tools
+Deleted files live in `<data>/.bifrost/trash/<scope>/<unix-timestamp>/`.
 
-- [ ] [Set up project integrations](https://gitlab.internal.rferee.dev/rferee/bifrost/-/settings/integrations)
+## Notes on the Minecraft service
 
-## Collaborate with your team
+Two settings matter regardless of bifrost:
 
-- [ ] [Invite team members and collaborators](https://docs.gitlab.com/ee/user/project/members/)
-- [ ] [Create a new merge request](https://docs.gitlab.com/ee/user/project/merge_requests/creating_merge_requests.html)
-- [ ] [Automatically close issues from merge requests](https://docs.gitlab.com/ee/user/project/issues/managing_issues.html#closing-issues-automatically)
-- [ ] [Enable merge request approvals](https://docs.gitlab.com/ee/user/project/merge_requests/approvals/)
-- [ ] [Set auto-merge](https://docs.gitlab.com/user/project/merge_requests/auto_merge/)
+- `stop_grace_period: 120s`. The 10-second default is shorter than itzg's
+  `STOP_DURATION` of 60s, so a plain `docker compose restart` can `SIGKILL` the JVM
+  mid-save. With `SYNC_CHUNK_WRITES: false` that risks region-file corruption.
+- Pin `RCON_PASSWORD`. Left unset, itzg generates a new random one on every boot.
+  bifrost can read it out of `/data/.rcon-cli.env`, but pinning removes the race.
 
-## Test and Deploy
+And turn off itzg's own mod management (`REMOVE_OLD_MODS`, `MODS`, `MODS_FILE`,
+`GENERIC_PACKS`) for any folder bifrost manages. The entrypoint deletes files in
+`mods/` and `config/` at boot, and two tools with different opinions about which
+jars belong there will not converge.
 
-Use the built-in continuous integration in GitLab.
+## Development
 
-- [ ] [Get started with GitLab CI/CD](https://docs.gitlab.com/ee/ci/quick_start/)
-- [ ] [Analyze your code for known vulnerabilities with Static Application Security Testing (SAST)](https://docs.gitlab.com/ee/user/application_security/sast/)
-- [ ] [Deploy to Kubernetes, Amazon EC2, or Amazon ECS using Auto Deploy](https://docs.gitlab.com/ee/topics/autodevops/requirements.html)
-- [ ] [Use pull-based deployments for improved Kubernetes management](https://docs.gitlab.com/ee/user/clusters/agent/)
-- [ ] [Set up protected environments](https://docs.gitlab.com/ee/ci/environments/protected_environments.html)
+```sh
+pip install -e ".[dev]"
+pytest
+ruff check .
+```
 
-***
-
-# Editing this README
-
-When you're ready to make this README your own, just edit this file and use the handy template below (or feel free to structure it however you want - this is just a starting point!). Thanks to [makeareadme.com](https://www.makeareadme.com/) for this template.
-
-## Suggestions for a good README
-
-Every project is different, so consider which of these sections apply to yours. The sections used in the template are suggestions for most open source projects. Also keep in mind that while a README can be too long and detailed, too long is better than too short. If you think your README is too long, consider utilizing another form of documentation rather than cutting out information.
-
-## Name
-Choose a self-explaining name for your project.
-
-## Description
-Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
-
-## Badges
-On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
-
-## Visuals
-Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
-
-## Installation
-Within a particular ecosystem, there may be a common way of installing things, such as using Yarn, NuGet, or Homebrew. However, consider the possibility that whoever is reading your README is a novice and would like more guidance. Listing specific steps helps remove ambiguity and gets people to using your project as quickly as possible. If it only runs in a specific context like a particular programming language version or operating system or has dependencies that have to be installed manually, also add a Requirements subsection.
-
-## Usage
-Use examples liberally, and show the expected output if you can. It's helpful to have inline the smallest example of usage that you can demonstrate, while providing links to more sophisticated examples if they are too long to reasonably include in the README.
-
-## Support
-Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
-
-## Roadmap
-If you have ideas for releases in the future, it is a good idea to list them in the README.
-
-## Contributing
-State if you are open to contributions and what your requirements are for accepting them.
-
-For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
-
-You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
-
-## Authors and acknowledgment
-Show your appreciation to those who have contributed to the project.
-
-## License
-For open source projects, say how it is licensed.
-
-## Project status
-If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
+Tests run against an in-process WebDAV server and a fake RCON server, so there is
+nothing to stand up. `tests/fake_webdav.py` reproduces the parts of the Nextcloud
+dialect that matter, including the silent `Depth: infinity` downgrade.

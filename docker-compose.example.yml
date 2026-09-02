@@ -1,0 +1,128 @@
+# bifrost next to a Fabric server, with mods synced both ways.
+#
+#   Rule 1 pulls mods/ down from Nextcloud and restarts the server.
+#   Rule 2 pushes anything that only exists locally back up.
+#
+# On the very first run the Nextcloud folder is empty, so rule 1 does nothing and
+# rule 2 seeds it from whatever is already in /data/mods. After that Nextcloud is
+# the source of truth: drop a jar in from a laptop and it lands on the server;
+# remove one and it is uninstalled.
+#
+# Before starting:
+#   cp .env.example .env                       # RCON_PASSWORD
+#   mkdir -p secrets
+#   printf '%s' '<nextcloud app password>' > secrets/nextcloud_app_password
+#
+# Set BIFROST_INIT_REMOTE=1 for the first start only, then remove it.
+
+name: bdgncraft
+
+secrets:
+  nextcloud_app_password:
+    file: ./secrets/nextcloud_app_password
+
+services:
+  bdgncraft-server:
+    image: docker.io/itzg/minecraft-server:java21
+    tty: true
+    stdin_open: true
+    restart: unless-stopped
+
+    # Required, and not only because of bifrost: the default 10s stop timeout is
+    # shorter than itzg's STOP_DURATION of 60s, so a plain `docker compose
+    # restart` can SIGKILL the JVM mid-save. With SYNC_CHUNK_WRITES off that is a
+    # live region-file corruption risk.
+    stop_grace_period: 120s
+
+    volumes:
+      - /srv/data/minecraft/bdgncraft:/data
+    environment:
+      EULA: "TRUE"
+      SERVER_PORT: 25565
+      MEMORY: "12G"
+      VERSION: "1.21.1"
+      TYPE: "FABRIC"
+      ENABLE_WHITELIST: false
+      MOTD: "bgdn craft)"
+      ONLINE_MODE: false
+      ALLOW_FLIGHT: true
+      VIEW_DISTANCE: 16
+      SIMULATION_DISTANCE: 8
+      SPAWN_PROTECTION: 0
+      SYNC_CHUNK_WRITES: false
+      MAX_PLAYERS: 20
+      VIRTUAL_HOST: bdgncraft.rfer.ee
+      VIRTUAL_PORT: 8100
+      DIFFICULTY: "normal"
+
+      # RCON is how bifrost warns players and stops the server. Pin the password:
+      # left unset, itzg generates a new random one on every boot.
+      ENABLE_RCON: "true"
+      RCON_PORT: 25575
+      RCON_PASSWORD: ${RCON_PASSWORD:?set RCON_PASSWORD in .env}
+      STOP_SERVER_ANNOUNCE_DELAY: 20
+
+      # bifrost manages mods/. Leave itzg's own mod machinery off, or the two
+      # will fight: REMOVE_OLD_MODS wipes *.jar under mods/ at boot, and
+      # MODS/MODS_FILE/GENERIC_PACKS delete entries dropped from their manifests.
+      REMOVE_OLD_MODS: "false"
+
+    ports:
+      - "100.81.35.141:22867:25565"
+      - "100.81.35.141:22867:25565/udp"
+
+  bdgncraft-bifrost:
+    image: docker-registry.internal.rferee.dev/rferee/bifrost:latest
+    restart: unless-stopped
+
+    # Never start a pass while the entrypoint is still populating /data.
+    depends_on:
+      bdgncraft-server:
+        condition: service_healthy
+
+    volumes:
+      - /srv/data/minecraft/bdgncraft:/data
+
+    secrets:
+      - nextcloud_app_password
+
+    environment:
+      BIFROST_NEXTCLOUD_URL: https://cloud.example.com
+      BIFROST_NEXTCLOUD_USER: bifrost
+      BIFROST_NEXTCLOUD_PASSWORD_FILE: /run/secrets/nextcloud_app_password
+      BIFROST_REMOTE_ROOT: bifrost/bdgncraft
+
+      # RCON lives on the compose network only. Never publish 25575.
+      BIFROST_RCON: bdgncraft-server:25575
+      BIFROST_RCON_PASSWORD: ${RCON_PASSWORD:?set RCON_PASSWORD in .env}
+
+      BIFROST_POLL_INTERVAL: 5m
+      BIFROST_RESTART_COUNTDOWN: 60s
+
+      # First run only: creates bifrost/bdgncraft/mods and its .bifrost-root
+      # sentinel. Remove it afterwards so a vanished folder is an error, not
+      # something bifrost silently recreates.
+      BIFROST_INIT_REMOTE: "1"
+
+      # --- mods: Nextcloud -> server, and it may uninstall ------------------
+      BIFROST_RULE_1: mods
+      BIFROST_RULE_1_DIRECTION: pull
+      BIFROST_RULE_1_DELETE: mirror
+      BIFROST_RULE_1_BEHAVIOR: restart
+
+      # --- mods: server -> Nextcloud, additive ------------------------------
+      # Seeds an empty Nextcloud folder from /data/mods on the first run, and
+      # afterwards backs up anything dropped in over SSH. Never deletes.
+      BIFROST_RULE_2: mods
+      BIFROST_RULE_2_DIRECTION: push
+      BIFROST_RULE_2_DELETE: "off"   # quoted: bare off is a YAML boolean
+      BIFROST_RULE_2_BEHAVIOR: none
+
+      # --- optional: see what the server writes to config/ ------------------
+      # One-way up into a folder nothing ever pulls back, so it cannot fight
+      # your edits. Uncomment once you want the visibility.
+      # BIFROST_RULE_3: config
+      # BIFROST_RULE_3_REMOTE: config-snapshot
+      # BIFROST_RULE_3_DIRECTION: push
+      # BIFROST_RULE_3_DELETE: "off"
+      # BIFROST_RULE_3_BEHAVIOR: none
