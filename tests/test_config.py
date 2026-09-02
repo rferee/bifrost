@@ -38,6 +38,26 @@ def test_defaults() -> None:
     assert config.state_dir == config.data_dir / ".bifrost"
 
 
+@pytest.mark.parametrize(
+    ("given", "expected"),
+    [
+        ("https://cloud.example.com", "https://cloud.example.com"),
+        ("https://cloud.example.com/", "https://cloud.example.com"),
+        # The URL Nextcloud shows in its own settings pane.
+        ("https://cloud.example.com/remote.php/dav/files/rferee", "https://cloud.example.com"),
+        ("https://cloud.example.com/remote.php/webdav", "https://cloud.example.com"),
+        # A subpath install must survive.
+        ("https://host.example.com/nextcloud", "https://host.example.com/nextcloud"),
+        (
+            "https://host.example.com/nextcloud/remote.php/dav/files/rferee",
+            "https://host.example.com/nextcloud",
+        ),
+    ],
+)
+def test_base_url_is_normalised(given: str, expected: str) -> None:
+    assert load(env(BIFROST_NEXTCLOUD_URL=given)).nextcloud_url == expected
+
+
 def test_missing_password_is_fatal() -> None:
     broken = env()
     del broken["BIFROST_NEXTCLOUD_PASSWORD"]

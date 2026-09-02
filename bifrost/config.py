@@ -315,6 +315,13 @@ def load(env: dict[str, str] | None = None) -> Config:
         raise ConfigError("BIFROST_NEXTCLOUD_URL is required (e.g. https://cloud.example.com)")
     if not url.startswith(("http://", "https://")):
         raise ConfigError(f"BIFROST_NEXTCLOUD_URL: {url!r} must start with http:// or https://")
+    # The DAV path is appended by the client, so trim it if someone pasted the
+    # full WebDAV URL Nextcloud shows in its settings. Nothing valid ever lives
+    # at or below /remote.php in a base URL, and a subpath install
+    # (https://host/nextcloud) is preserved.
+    marker = url.find("/remote.php")
+    if marker != -1:
+        url = url[:marker]
 
     user = _get(env, "BIFROST_NEXTCLOUD_USER")
     if not user:

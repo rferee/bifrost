@@ -52,7 +52,7 @@ a folder: whatever credential bifrost holds can reach the whole account.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `BIFROST_NEXTCLOUD_URL` | *required* | e.g. `https://cloud.example.com` |
+| `BIFROST_NEXTCLOUD_URL` | *required* | Base URL only, e.g. `https://cloud.example.com`. bifrost appends the DAV path itself; a pasted `/remote.php/...` suffix is trimmed |
 | `BIFROST_NEXTCLOUD_USER` | *required* | Nextcloud username |
 | `BIFROST_NEXTCLOUD_PASSWORD` / `_FILE` | *required* | App password. Prefer `_FILE` with a Docker secret |
 | `BIFROST_REMOTE_ROOT` | *(account root)* | Path all rules hang off, e.g. `bifrost/bdgncraft` |
