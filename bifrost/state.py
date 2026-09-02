@@ -50,6 +50,12 @@ CREATE TABLE IF NOT EXISTS breaker (
     reason TEXT,
     at     INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS flags (
+    name  TEXT PRIMARY KEY,
+    value TEXT,
+    at    INTEGER NOT NULL
+);
 """
 
 
@@ -171,3 +177,22 @@ class State:
 
     def reset_breaker(self, name: str) -> None:
         self._db.execute("DELETE FROM breaker WHERE name = ?", (name,))
+
+    # -- flags --------------------------------------------------------------
+    #
+    # For work that outlives the process. A restart deferred because the server
+    # was unreachable must still happen after bifrost itself is restarted,
+    # otherwise the files sit on disk and the server never picks them up.
+
+    def set_flag(self, name: str, value: str) -> None:
+        self._db.execute(
+            "INSERT OR REPLACE INTO flags (name, value, at) VALUES (?,?,?)",
+            (name, value, int(time.time())),
+        )
+
+    def get_flag(self, name: str) -> str | None:
+        row = self._db.execute("SELECT value FROM flags WHERE name = ?", (name,)).fetchone()
+        return row["value"] if row else None
+
+    def clear_flag(self, name: str) -> None:
+        self._db.execute("DELETE FROM flags WHERE name = ?", (name,))

@@ -64,7 +64,8 @@ def test_an_untouched_folder_does_not_restart_anything(monkeypatch, tmp_path, re
 
         rcon.commands.clear()
         assert main(["--once"]) == 0
-        assert rcon.commands == []
+        # The startup probe sends `list`; nothing else should happen.
+        assert rcon.commands == ["list"]
 
 
 def test_local_jars_are_seeded_up_on_the_first_pass(monkeypatch, tmp_path, remote, data, server):
@@ -90,6 +91,48 @@ def test_bad_credentials_exit_without_retrying(monkeypatch, tmp_path, remote, da
             monkeypatch.setenv(key, value)
         monkeypatch.setenv("BIFROST_NEXTCLOUD_PASSWORD", "wrong")
         assert main([]) == EXIT_AUTH
+
+
+def test_unreachable_rcon_does_not_roll_back_or_trip_the_breaker(
+    monkeypatch, tmp_path, remote, data, server
+):
+    """A restart that never happened implicates nothing.
+
+    An unresolvable RCON host means the server was never stopped, so the files
+    that just synced are not suspect: rolling them back would undo good work
+    and quarantine it over a networking problem.
+    """
+    seed_folder(remote)
+    write_remote(remote, "mods/fabric-api.jar", b"the mod")
+    state_dir = tmp_path / "state"
+
+    with FakeRcon(password="secret") as rcon:
+        env = _env(server, rcon, data, state_dir)
+        monkeypatch.setenv("BIFROST_BOOT_TIMEOUT", "1s")
+
+    # The RCON server is gone before bifrost ever runs.
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    assert main(["--once"]) == 0
+
+    # The file is still there, unquarantined, and the breaker is shut.
+    assert (data / "mods" / "fabric-api.jar").read_bytes() == b"the mod"
+
+    from bifrost.state import State
+
+    state = State(state_dir / "state.db")
+    try:
+        assert state.breaker_reason("restart") is None
+        assert state.quarantined() == set()
+    finally:
+        state.close()
+
+    # And once RCON is reachable again, the deferred restart happens.
+    host, port = env["BIFROST_RCON"].split(":")
+    with FakeRcon(password="secret", responder=_responder) as rcon:
+        monkeypatch.setenv("BIFROST_RCON", f"{rcon.address[0]}:{rcon.address[1]}")
+        assert main(["--once"]) == 0
+        assert "stop" in rcon.commands
 
 
 def test_a_broken_config_exits_immediately(monkeypatch):
@@ -133,7 +176,7 @@ def test_a_failed_boot_rolls_back_and_quarantines(monkeypatch, tmp_path, remote,
             monkeypatch.setenv(key, value)
         main(["--once"])
         assert not (data / "mods" / "bad.jar").exists()
-        assert rcon.commands == []
+        assert "stop" not in rcon.commands
 
     # ...and once cleared, the quarantine still keeps the bad jar out.
     with FakeRcon(password="secret", responder=_responder) as rcon:

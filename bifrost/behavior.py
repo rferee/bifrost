@@ -34,6 +34,14 @@ _COUNTDOWN_MARKS = (300, 120, 60, 30, 10, 5)
 class RestartResult:
     ok: bool
     detail: str
+    stopped: bool = False
+    """Whether `stop` was actually issued.
+
+    This is the difference between "the server would not come back after we
+    stopped it" - which implicates the files we just applied - and "we could
+    not reach the server at all", which implicates nothing. Only the former
+    justifies a rollback.
+    """
 
 
 class NoRconConfigured(Exception):
@@ -96,6 +104,7 @@ class ServerController:
         except (RconError, NoRconConfigured) as exc:
             return RestartResult(False, f"cannot reach the server to restart it: {exc}")
 
+        stopped = False
         try:
             players = self.players_online(client)
             if players == 0:
@@ -120,14 +129,17 @@ class ServerController:
             client.command("save-all flush")
             log.info("stopping the server (%s)", reason)
             client.command("stop")
+            stopped = True
         except RconError as exc:
-            return RestartResult(False, f"RCON failed during the restart sequence: {exc}")
+            return RestartResult(
+                False, f"RCON failed during the restart sequence: {exc}", stopped
+            )
         finally:
             client.close()
 
         deadline = time.monotonic() + self.config.boot_timeout
         if stop_event.wait(self.post_stop_delay):
-            return RestartResult(False, "interrupted")
+            return RestartResult(False, "interrupted", stopped)
 
         try:
             alive = wait_until_alive(
@@ -137,16 +149,17 @@ class ServerController:
                 deadline,
             )
         except RconAuthError as exc:
-            return RestartResult(False, str(exc))
+            return RestartResult(False, str(exc), stopped)
 
         if alive:
-            return RestartResult(True, "server is back up")
+            return RestartResult(True, "server is back up", stopped)
 
         return RestartResult(
             False,
             f"the server did not answer RCON within {self.config.boot_timeout}s. "
             "Either a synced file keeps it from starting, or the container's restart policy "
             "is not always/unless-stopped.",
+            stopped,
         )
 
     @staticmethod

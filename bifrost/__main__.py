@@ -21,6 +21,7 @@ from .webdav import AuthError, NextcloudClient, QuotaExceeded, WebDAVError
 log = logging.getLogger("bifrost")
 
 BREAKER = "restart"
+RESTART_PENDING = "restart_pending"
 
 EXIT_OK = 0
 EXIT_CONFIG = 2
@@ -61,6 +62,29 @@ def _self_test(client: NextcloudClient, config: Config) -> None:
             "only %.1f MiB of Nextcloud quota left. Deletions go to the trash bin and every "
             "overwrite keeps a version, both of which count against it.",
             available / 1048576,
+        )
+
+
+def _rcon_self_test(config: Config) -> None:
+    """Report up front whether the server can be driven at all.
+
+    Otherwise the first sign of a wrong hostname is a deferred restart after
+    files have already moved.
+    """
+    if not config.rcon_host or not any(rule.fires_behavior for rule in config.rules):
+        return
+    try:
+        with ServerController(config).connect() as client:
+            client.command("list")
+        log.info("RCON reachable at %s:%s", config.rcon_host, config.rcon_port)
+    except RconAuthError:
+        raise
+    except (RconError, NoRconConfigured) as exc:
+        log.warning(
+            "RCON is not reachable: %s. Files will still sync, but restarts will be deferred "
+            "until it answers. Check that BIFROST_RCON names the Minecraft compose service and "
+            "that both containers are in the same compose project.",
+            exc,
         )
 
 
@@ -108,16 +132,19 @@ def _fire(
     controller: ServerController,
     pending: Pending,
     stop_event: threading.Event,
-) -> None:
+) -> bool:
+    """Run the pending behaviors. Returns False if they should be retried."""
     for commands in pending.rcon:
         try:
             controller.run_commands(commands)
         except (RconError, NoRconConfigured) as exc:
             log.error("rcon behavior failed: %s", exc)
+    pending.rcon.clear()
 
     if not pending.restart:
         engine.pending_snapshots.clear()
-        return
+        state.clear_flag(RESTART_PENDING)
+        return True
 
     reason = f"{len(pending.files)} file change(s)"
     log.info("restarting the server: %s", reason)
@@ -126,20 +153,34 @@ def _fire(
     if result.ok:
         log.info("restart complete: %s", result.detail)
         engine.pending_snapshots.clear()
-        return
+        state.clear_flag(RESTART_PENDING)
+        return True
 
     if stop_event.is_set():
-        return
+        return False
+
+    if not result.stopped:
+        # The server was never stopped, so nothing that was applied is
+        # implicated. Rolling back here would undo good files and quarantine
+        # them over what is usually a DNS or networking problem.
+        log.error(
+            "could not restart the server: %s. Synced files are left in place and the "
+            "restart is deferred to the next pass. Nothing was rolled back.",
+            result.detail,
+        )
+        return False
 
     log.error("restart failed: %s", result.detail)
     tail = latest_log_tail(config.data_dir)
     if tail:
         log.error("last lines of logs/latest.log:\n%s", tail)
 
+    state.clear_flag(RESTART_PENDING)
+
     if not pending.rollbacks:
         state.trip_breaker(BREAKER, result.detail)
         log.error("nothing to roll back. Breaker tripped; set BIFROST_RESET_BREAKER=1 to resume.")
-        return
+        return True
 
     _rollback(config, engine, state, pending)
 
@@ -150,13 +191,14 @@ def _fire(
             "server recovered after rollback. The offending file(s) stay quarantined and will "
             "not be applied again until they change in Nextcloud."
         )
-        return
+        return True
 
     state.trip_breaker(BREAKER, f"{result.detail} (rollback also failed: {retry.detail})")
     log.error(
         "server is still down after the rollback. Breaker tripped - bifrost will not touch it "
         "again. Fix it by hand, then restart bifrost with BIFROST_RESET_BREAKER=1."
     )
+    return True
 
 
 def _run_pass(config: Config, engine: Engine, pending: Pending) -> bool:
@@ -194,16 +236,25 @@ def _run_pass(config: Config, engine: Engine, pending: Pending) -> bool:
             pending.since = pending.since or time.monotonic()
             if rule.behavior == "restart":
                 pending.restart = True
+                engine.state.set_flag(RESTART_PENDING, rule.name)
             elif rule.rcon_commands and rule.rcon_commands not in pending.rcon:
                 pending.rcon.append(rule.rcon_commands)
 
     return changed_local
 
 
+def _restore_pending(state: State, pending: Pending) -> None:
+    """Pick up a restart that a previous process could not deliver."""
+    if state.get_flag(RESTART_PENDING):
+        log.info("a restart was still owed from a previous run; it will be delivered now")
+        pending.restart = True
+
+
 def run(config: Config, client: NextcloudClient, state: State, stop_event: threading.Event) -> int:
     engine = Engine(config, client, state)
     controller = ServerController(config)
     pending = Pending()
+    _restore_pending(state, pending)
 
     while not stop_event.is_set():
         blocked = state.breaker_reason(BREAKER)
@@ -235,8 +286,7 @@ def run(config: Config, client: NextcloudClient, state: State, stop_event: threa
                 continue
             log.info("settle window capped at %ss; acting now", config.settle_max)
 
-        if pending:
-            _fire(config, engine, state, controller, pending, stop_event)
+        if pending and _fire(config, engine, state, controller, pending, stop_event):
             pending.clear()
 
         stop_event.wait(config.poll_interval)
@@ -294,6 +344,8 @@ def main(argv: list[str] | None = None) -> int:
         signal.signal(sig, _shutdown)
 
     try:
+        _rcon_self_test(config)
+
         if "--once" in argv:
             blocked = state.breaker_reason(BREAKER)
             if blocked:
@@ -305,6 +357,7 @@ def main(argv: list[str] | None = None) -> int:
                 return EXIT_OK
             engine = Engine(config, client, state)
             pending = Pending()
+            _restore_pending(state, pending)
             _run_pass(config, engine, pending)
             if pending:
                 _fire(config, engine, state, ServerController(config), pending, stop_event)
